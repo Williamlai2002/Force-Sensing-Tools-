@@ -4,7 +4,8 @@ const int DOUT_PIN = 3;
 const int SCK_PIN = 2;
 
 // CHANGE THIS after calibration
-float calibration_factor = 100;
+//float calibration_factor = 100;
+float calibration_factor = 42;
 
 HX711 scale;
 
@@ -31,5 +32,5 @@ void loop()
   Serial.print(weight, 1);
   Serial.println(" g");
 
-  delay(500);
+  delay(50);
 }
