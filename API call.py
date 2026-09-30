@@ -10,7 +10,7 @@ def api_call(mode):
 # Examples:
 # print(api_call("info"))       # Get IP, RSSI, calibration
 # print(api_call("live"))       # Get current reading
-# api_call("start")             # Start recording
+ api_call("start")             # Start recording
 
 # api_call("stop")              # Stop recording
 # data = api_call("recorded")   # Fetch all recorded data

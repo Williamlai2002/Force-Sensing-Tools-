@@ -8,16 +8,36 @@
 
 
 // ============================================================
-// HX711
+// SENSORS
 // ============================================================
 
-const int LOADCELL_DOUT_PIN = D0;
-const int LOADCELL_SCK_PIN  = D1;
+// ---------------- FORCE / HX711 ----------------
 
-HX711 scale;
+const int LOADCELL_DOUT_PIN = 3;
+const int LOADCELL_SCK_PIN  = 2;
 
-// Change this after calibration.
-float calibrationFactor = 1.0;
+HX711 scaleForce;
+
+// Built-in starting calibration factor.
+// This is used when the ESP32 boots.
+float forceCalibrationFactor = 42.0;
+
+// Raw HX711 zero/tare value.
+long forceZeroRaw = 0;
+
+// Gravity conversion.
+const float GRAVITY = 9.80665;
+
+
+// ---------------- TORQUE ----------------
+
+const int TORQUE_ANALOG_PIN = 0;
+
+float torqueZeroVoltage = 0.0;
+
+// Original calibration:
+// 0.38 Nm = 1100 ADC counts
+float torqueCalibrationFactor = 0.38 / 1100.0;
 
 
 // ============================================================
@@ -28,6 +48,7 @@ float calibrationFactor = 1.0;
 
 uint32_t recordTimes[MAX_RECORD_SAMPLES];
 float    recordForce[MAX_RECORD_SAMPLES];
+float    recordTorque[MAX_RECORD_SAMPLES];
 
 uint32_t recordCount = 0;
 uint32_t recordStartTime = 0;
@@ -40,7 +61,6 @@ bool recording = false;
 // ============================================================
 
 bool dumping = false;
-
 uint32_t dumpIndex = 0;
 
 const int DUMP_CHUNK_SIZE = 40;
@@ -51,7 +71,6 @@ const int DUMP_CHUNK_SIZE = 40;
 // ============================================================
 
 AsyncWebServer server(80);
-
 AsyncWebSocket ws("/ws");
 
 unsigned long lastSample = 0;
@@ -65,17 +84,13 @@ const unsigned long LIVE_INTERVAL_MS = 100;
 // ============================================================
 
 void logMsg(const String &msg) {
-
   Serial.println(msg);
 
   if (ws.count() > 0) {
-
     String escaped;
-
     escaped.reserve(msg.length() + 8);
 
     for (size_t i = 0; i < msg.length(); i++) {
-
       char c = msg[i];
 
       if (c == '"' || c == '\\') {
@@ -91,6 +106,130 @@ void logMsg(const String &msg) {
       "\"}"
     );
   }
+}
+
+
+// ============================================================
+// FORCE SENSOR FUNCTIONS
+// ============================================================
+
+// Read raw HX711 value.
+long readForceRaw() {
+  return scaleForce.read_average(20);
+}
+
+
+// ------------------------------------------------------------
+// TARE FORCE
+// ------------------------------------------------------------
+
+void tareForceSensor() {
+
+  Serial.println(
+    "Force tare started - remove all load from load cell."
+  );
+
+  // HX711 library performs averaging and stores the offset.
+  scaleForce.tare(20);
+
+  // Read back the actual raw zero value.
+  forceZeroRaw = scaleForce.read_average(5);
+
+  // Keep the current calibration factor.
+  scaleForce.set_scale(forceCalibrationFactor);
+
+  Serial.print("Force zero raw = ");
+  Serial.println(forceZeroRaw);
+
+  Serial.print("Force calibration factor = ");
+  Serial.println(forceCalibrationFactor, 6);
+
+  logMsg(
+    "Force tare complete. Raw zero = " +
+    String(forceZeroRaw)
+  );
+}
+
+
+// ------------------------------------------------------------
+// CALIBRATE FORCE
+//
+// knownMassKg = physical calibration mass in kilograms.
+//
+// Example:
+// 4 kg -> 39.2266 N
+//
+// calibration factor:
+//
+//     raw difference
+// -----------------------
+//       force in N
+//
+// HX711 get_units() effectively does:
+//
+//     (raw - zero) / calibration factor
+// ------------------------------------------------------------
+
+bool calibrateForce(float knownMassKg, float &newFactor, long &rawReading) {
+
+  if (knownMassKg <= 0.0) {
+    return false;
+  }
+
+  // Convert kg to Newtons.
+  float knownForceN = knownMassKg * GRAVITY;
+
+  Serial.println();
+  Serial.println("========== FORCE CALIBRATION ==========");
+  Serial.print("Known mass: ");
+  Serial.print(knownMassKg, 4);
+  Serial.println(" kg");
+
+  Serial.print("Known force: ");
+  Serial.print(knownForceN, 4);
+  Serial.println(" N");
+
+  // Read raw HX711 value with calibration weight applied.
+  rawReading = scaleForce.read_average(20);
+
+  Serial.print("Raw loaded reading: ");
+  Serial.println(rawReading);
+
+  Serial.print("Raw zero reading: ");
+  Serial.println(forceZeroRaw);
+
+  // Difference between loaded and zero.
+  long rawDifference = rawReading - forceZeroRaw;
+
+  Serial.print("Raw difference: ");
+  Serial.println(rawDifference);
+
+  if (rawDifference == 0) {
+    Serial.println("ERROR: No change detected from load cell.");
+    return false;
+  }
+
+  // Calculate calibration factor.
+  newFactor = (float)rawDifference / knownForceN;
+
+  // Apply the new factor immediately.
+  forceCalibrationFactor = newFactor;
+  scaleForce.set_scale(forceCalibrationFactor);
+
+  Serial.print("NEW FORCE CALIBRATION FACTOR = ");
+  Serial.println(forceCalibrationFactor, 6);
+
+  // Check resulting measurement.
+  float measuredForce = scaleForce.get_units(10);
+
+  Serial.print("Measured force after calibration: ");
+  Serial.print(measuredForce, 4);
+  Serial.println(" N");
+
+  Serial.println("========================================");
+  Serial.println();
+
+  return true;
 }
 
 
@@ -113,7 +252,6 @@ void onWsEvent(
       "WebSocket client #%u connected\n",
       client->id()
     );
-
   }
 
   else if (type == WS_EVT_DISCONNECT) {
@@ -122,14 +260,11 @@ void onWsEvent(
       "WebSocket client #%u disconnected\n",
       client->id()
     );
-
   }
 
   else if (type == WS_EVT_DATA) {
 
-    AwsFrameInfo *info =
-      (AwsFrameInfo*)arg;
-
+    AwsFrameInfo *info = (AwsFrameInfo*)arg;
 
     if (
       info->final &&
@@ -137,7 +272,6 @@ void onWsEvent(
       info->len == len &&
       info->opcode == WS_TEXT
     ) {
-
 
       // ======================================================
       // START
@@ -149,18 +283,14 @@ void onWsEvent(
       ) {
 
         recording = true;
-
         dumping = false;
-
         recordCount = 0;
-
         recordStartTime = millis();
 
         logMsg(
           "Recording started (on-device buffering)"
         );
       }
-
 
       // ======================================================
       // STOP
@@ -172,9 +302,7 @@ void onWsEvent(
       ) {
 
         recording = false;
-
         dumping = true;
-
         dumpIndex = 0;
 
         logMsg(
@@ -183,7 +311,6 @@ void onWsEvent(
           " samples captured, sending to browser"
         );
       }
-
 
       // ======================================================
       // RESUME
@@ -196,19 +323,11 @@ void onWsEvent(
 
         char numBuf[16];
 
-        size_t numLen =
-          len - 7;
+        size_t numLen = len - 7;
 
-
-        if (
-          numLen >=
-          sizeof(numBuf)
-        ) {
-
-          numLen =
-            sizeof(numBuf) - 1;
+        if (numLen >= sizeof(numBuf)) {
+          numLen = sizeof(numBuf) - 1;
         }
-
 
         memcpy(
           numBuf,
@@ -216,18 +335,11 @@ void onWsEvent(
           numLen
         );
 
-
         numBuf[numLen] = '\0';
 
+        uint32_t fromIndex = atoi(numBuf);
 
-        uint32_t fromIndex =
-          atoi(numBuf);
-
-
-        if (
-          fromIndex >=
-          recordCount
-        ) {
+        if (fromIndex >= recordCount) {
 
           char done[40];
 
@@ -239,14 +351,11 @@ void onWsEvent(
           );
 
           ws.textAll(done);
-
         }
 
         else {
 
-          dumpIndex =
-            fromIndex;
-
+          dumpIndex = fromIndex;
           dumping = true;
 
           logMsg(
@@ -268,42 +377,108 @@ void setup() {
 
   Serial.begin(115200);
 
+  delay(1000);
+
+  // ESP32-C3 ADC resolution.
+  analogReadResolution(12);
+
 
   // ==========================================================
-  // HX711
+  // FORCE SENSOR INIT
   // ==========================================================
 
-  scale.begin(
+  scaleForce.begin(
     LOADCELL_DOUT_PIN,
     LOADCELL_SCK_PIN
   );
 
+  Serial.println();
+  Serial.println("======================================");
+  Serial.println("FORCE SENSOR INITIALISATION");
+  Serial.println("======================================");
 
-  Serial.println(
-    "Taring load cell - keep it empty/unloaded..."
+  Serial.print(
+    "Starting calibration factor: "
   );
 
+  Serial.println(
+    forceCalibrationFactor,
+    6
+  );
+
+  Serial.println(
+    "Taring force sensor..."
+  );
 
   delay(1000);
 
+  // Tare the HX711.
+  scaleForce.tare(20);
 
-  scale.tare();
+  // Read actual raw zero.
+  forceZeroRaw = scaleForce.read_average(5);
 
+  // Apply built-in calibration factor.
+  scaleForce.set_scale(
+    forceCalibrationFactor
+  );
 
-  scale.set_scale(
-    calibrationFactor
+  Serial.print(
+    "Force raw zero = "
+  );
+
+  Serial.println(
+    forceZeroRaw
+  );
+
+  Serial.print(
+    "Force calibration factor = "
+  );
+
+  Serial.println(
+    forceCalibrationFactor,
+    6
   );
 
 
-  Serial.println(
-    "Tare complete."
+  // ==========================================================
+  // TORQUE SENSOR INIT
+  // ==========================================================
+
+  pinMode(
+    TORQUE_ANALOG_PIN,
+    INPUT
   );
 
+  Serial.println(
+    "Taring torque sensor..."
+  );
+
+  long analogSum = 0;
+
+  for (int i = 0; i < 100; i++) {
+
+    analogSum += analogRead(
+      TORQUE_ANALOG_PIN
+    );
+
+    delay(5);
+  }
+
+  torqueZeroVoltage =
+    (float)analogSum / 100.0;
+
+  Serial.print(
+    "Torque zero ADC = "
+  );
 
   Serial.println(
-    "To calibrate: place a known weight, "
-    "watch the raw 'v' values in the live readout, "
-    "then set calibrationFactor = raw_reading / known_weight."
+    torqueZeroVoltage,
+    2
+  );
+
+  Serial.println(
+    "Sensor tare complete."
   );
 
 
@@ -314,7 +489,6 @@ void setup() {
   Serial.println(
     "Trying saved WiFi credentials..."
   );
-
 
   bool connected =
     WiFiProvision::tryConnectSTA();
@@ -334,34 +508,23 @@ void setup() {
       WiFi.localIP()
     );
 
-
     WiFiProvision::startMDNS(
       "screwdriver"
     );
 
-
     Serial.println(
-      "Open http://screwdriver.local "
-      "in your browser."
+      "Open http://screwdriver.local in your browser."
     );
 
 
-    // --------------------------------------------------------
-    // WebSocket
-    // --------------------------------------------------------
+    ws.onEvent(onWsEvent);
 
-    ws.onEvent(
-      onWsEvent
-    );
-
-    server.addHandler(
-      &ws
-    );
+    server.addHandler(&ws);
 
 
-    // --------------------------------------------------------
-    // Dashboard
-    // --------------------------------------------------------
+    // ========================================================
+    // MAIN WEBPAGE
+    // ========================================================
 
     server.on(
       "/",
@@ -381,87 +544,758 @@ void setup() {
     );
 
 
-    // --------------------------------------------------------
-    // UNIFIED API ENDPOINT (For Python / External Tools)
-    // --------------------------------------------------------
+    // ========================================================
+    // UNIFIED API
+    // ========================================================
 
-    server.on("/api", HTTP_GET, [](AsyncWebServerRequest *request) {
-      
-      String mode = "";
-      if (request->hasParam("mode")) {
-        mode = request->getParam("mode")->value();
-      }
+    server.on(
+      "/api",
+      HTTP_GET,
+      [](AsyncWebServerRequest *request) {
 
-      if (mode == "live") {
-        float currentForce = scale.get_units(1);
-        char json[128];
-        snprintf(json, sizeof(json), 
-          "{\"mode\":\"live\",\"t\":%lu,\"force\":%.4f}",
-          millis(),
-          currentForce
-        );
-        request->send(200, "application/json", json);
-      }
-      else if (mode == "recorded") {
-        String json = "{\"mode\":\"recorded\",\"count\":" + String(recordCount) + ",\"data\":[";
-        for (uint32_t i = 0; i < recordCount; i++) {
-          if (i > 0) json += ",";
-          json += "{\"t\":" + String(recordTimes[i]) + ",\"force\":" + String(recordForce[i], 4) + "}";
+        String mode = "";
+
+        if (request->hasParam("mode")) {
+          mode =
+            request->getParam("mode")->value();
         }
-        json += "]}";
-        request->send(200, "application/json", json);
-      }
-      else if (mode == "status") {
-        char json[256];
-        snprintf(json, sizeof(json),
-          "{\"mode\":\"status\",\"recording\":%s,\"recordCount\":%u,\"freeHeap\":%u,\"uptime\":%lu}",
-          recording ? "true" : "false",
-          recordCount,
-          ESP.getFreeHeap(),
-          millis() / 1000
-        );
-        request->send(200, "application/json", json);
-      }
-      else if (mode == "start") {
-        recording = true;
-        dumping = false;
-        recordCount = 0;
-        recordStartTime = millis();
-        request->send(200, "application/json", "{\"mode\":\"start\",\"status\":\"recording\"}");
-      }
-      else if (mode == "stop") {
-        recording = false;
-        char json[64];
-        snprintf(json, sizeof(json),
-          "{\"mode\":\"stop\",\"status\":\"stopped\",\"count\":%u}",
-          recordCount
-        );
-        request->send(200, "application/json", json);
-      }
-      else if (mode == "clear") {
-        recordCount = 0;
-        recording = false;
-        dumping = false;
-        request->send(200, "application/json", "{\"mode\":\"clear\",\"status\":\"cleared\"}");
-      }
-      else if (mode == "info") {
-        char json[256];
-        snprintf(json, sizeof(json),
-          "{\"mode\":\"info\",\"ip\":\"%s\",\"rssi\":%d,\"calibration\":%.2f,\"maxSamples\":%u}",
-          WiFi.localIP().toString().c_str(),
-          WiFi.RSSI(),
-          calibrationFactor,
-          MAX_RECORD_SAMPLES
-        );
-        request->send(200, "application/json", json);
-      }
-      else {
-        request->send(400, "application/json", 
-          "{\"error\":\"Invalid or missing mode parameter\",\"valid_modes\":[\"live\",\"recorded\",\"status\",\"start\",\"stop\",\"clear\",\"info\"]}"
-        );
-      }
-    });
 
+
+        // ====================================================
+        // LIVE
+        // ====================================================
+
+        if (mode == "live") {
+
+          float currentForce =
+            scaleForce.get_units(5);
+
+
+          long strainTotal = 0;
+
+          for (int i = 0; i < 10; i++) {
+
+            strainTotal +=
+              analogRead(
+                TORQUE_ANALOG_PIN
+              );
+
+            delay(1);
+          }
+
+
+          float currentTorque =
+            (
+              ((float)strainTotal / 10.0)
+              -
+              torqueZeroVoltage
+            )
+            *
+            torqueCalibrationFactor;
+
+
+          char json[160];
+
+          snprintf(
+            json,
+            sizeof(json),
+
+            "{\"mode\":\"live\",\"t\":%lu,\"force\":%.4f,\"torque\":%.4f}",
+
+            millis(),
+
+            currentForce,
+
+            currentTorque
+          );
+
+          request->send(
+            200,
+            "application/json",
+            json
+          );
+        }
+
+
+        // ====================================================
+        // RECORDED
+        // ====================================================
+
+        else if (mode == "recorded") {
+
+          String json =
+            "{\"mode\":\"recorded\",\"count\":" +
+            String(recordCount) +
+            ",\"data\":[";
+
+
+          for (
+            uint32_t i = 0;
+            i < recordCount;
+            i++
+          ) {
+
+            if (i > 0) {
+              json += ",";
+            }
+
+            json +=
+              "{\"t\":" +
+              String(recordTimes[i]) +
+              ",\"force\":" +
+              String(recordForce[i], 4) +
+              ",\"torque\":" +
+              String(recordTorque[i], 4) +
+              "}";
+          }
+
+
+          json += "]}";
+
+
+          request->send(
+            200,
+            "application/json",
+            json
+          );
+        }
+
+
+        // ====================================================
+        // STATUS
+        // ====================================================
+
+        else if (mode == "status") {
+
+          char json[320];
+
+          snprintf(
+            json,
+            sizeof(json),
+
+            "{\"mode\":\"status\","
+            "\"recording\":%s,"
+            "\"recordCount\":%u,"
+            "\"freeHeap\":%u,"
+            "\"uptime\":%lu,"
+            "\"forceFactor\":%.6f,"
+            "\"forceZeroRaw\":%ld}",
+
+            recording ? "true" : "false",
+
+            recordCount,
+
+            ESP.getFreeHeap(),
+
+            millis() / 1000,
+
+            forceCalibrationFactor,
+
+            forceZeroRaw
+          );
+
+
+          request->send(
+            200,
+            "application/json",
+            json
+          );
+        }
+
+
+        // ====================================================
+        // START
+        // ====================================================
+
+        else if (mode == "start") {
+
+          recording = true;
+          dumping = false;
+
+          recordCount = 0;
+
+          recordStartTime = millis();
+
+
+          request->send(
+            200,
+            "application/json",
+            "{\"mode\":\"start\",\"status\":\"recording\"}"
+          );
+        }
+
+
+        // ====================================================
+        // STOP
+        // ====================================================
+
+        else if (mode == "stop") {
+
+          recording = false;
+
+          char json[64];
+
+          snprintf(
+            json,
+            sizeof(json),
+
+            "{\"mode\":\"stop\",\"status\":\"stopped\",\"count\":%u}",
+
+            recordCount
+          );
+
+
+          request->send(
+            200,
+            "application/json",
+            json
+          );
+        }
+
+
+        // ====================================================
+        // CLEAR
+        // ====================================================
+
+        else if (mode == "clear") {
+
+          recordCount = 0;
+
+          recording = false;
+
+          dumping = false;
+
+
+          request->send(
+            200,
+            "application/json",
+            "{\"mode\":\"clear\",\"status\":\"cleared\"}"
+          );
+        }
+
+
+        // ====================================================
+        // INFO
+        // ====================================================
+
+        else if (mode == "info") {
+
+          char json[320];
+
+          snprintf(
+            json,
+            sizeof(json),
+
+            "{\"mode\":\"info\","
+            "\"ip\":\"%s\","
+            "\"rssi\":%d,"
+            "\"forceCalibration\":%.6f,"
+            "\"forceZeroRaw\":%ld,"
+            "\"torqueCalibration\":%.6f,"
+            "\"maxSamples\":%u}",
+
+            WiFi.localIP().toString().c_str(),
+
+            WiFi.RSSI(),
+
+            forceCalibrationFactor,
+
+            forceZeroRaw,
+
+            torqueCalibrationFactor,
+
+            MAX_RECORD_SAMPLES
+          );
+
+
+          request->send(
+            200,
+            "application/json",
+            json
+          );
+        }
+
+
+        // ====================================================
+        // TARE BOTH
+        // ====================================================
+
+        else if (mode == "tare") {
+
+          // FORCE
+
+          scaleForce.tare(20);
+
+          forceZeroRaw =
+            scaleForce.read_average(5);
+
+          scaleForce.set_scale(
+            forceCalibrationFactor
+          );
+
+
+          // TORQUE
+
+          long sum = 0;
+
+          for (int i = 0; i < 100; i++) {
+
+            sum +=
+              analogRead(
+                TORQUE_ANALOG_PIN
+              );
+
+            delay(5);
+          }
+
+          torqueZeroVoltage =
+            (float)sum / 100.0;
+
+
+          char json[180];
+
+          snprintf(
+            json,
+            sizeof(json),
+
+            "{\"mode\":\"tare\","
+            "\"status\":\"success\","
+            "\"forceZeroRaw\":%ld,"
+            "\"torqueZeroRaw\":%.2f}",
+
+            forceZeroRaw,
+
+            torqueZeroVoltage
+          );
+
+
+          request->send(
+            200,
+            "application/json",
+            json
+          );
+        }
+
+
+        // ====================================================
+        // TARE FORCE ONLY
+        // ====================================================
+
+        else if (mode == "tare_force") {
+
+          Serial.println(
+            "Web request: FORCE TARE"
+          );
+
+          scaleForce.tare(20);
+
+          forceZeroRaw =
+            scaleForce.read_average(5);
+
+          scaleForce.set_scale(
+            forceCalibrationFactor
+          );
+
+
+          Serial.print(
+            "New force zero raw = "
+          );
+
+          Serial.println(
+            forceZeroRaw
+          );
+
+
+          char json[180];
+
+          snprintf(
+            json,
+            sizeof(json),
+
+            "{\"mode\":\"tare_force\","
+            "\"status\":\"success\","
+            "\"zeroRaw\":%ld,"
+            "\"factor\":%.6f}",
+
+            forceZeroRaw,
+
+            forceCalibrationFactor
+          );
+
+
+          request->send(
+            200,
+            "application/json",
+            json
+          );
+        }
+
+
+        // ====================================================
+        // TARE TORQUE ONLY
+        // ====================================================
+
+        else if (mode == "tare_torque") {
+
+          long sum = 0;
+
+          for (int i = 0; i < 100; i++) {
+
+            sum +=
+              analogRead(
+                TORQUE_ANALOG_PIN
+              );
+
+            delay(5);
+          }
+
+
+          torqueZeroVoltage =
+            (float)sum / 100.0;
+
+
+          char json[160];
+
+          snprintf(
+            json,
+            sizeof(json),
+
+            "{\"mode\":\"tare_torque\","
+            "\"status\":\"success\","
+            "\"zeroRaw\":%.2f}",
+
+            torqueZeroVoltage
+          );
+
+
+          request->send(
+            200,
+            "application/json",
+            json
+          );
+        }
+
+
+        // ====================================================
+        // CALIBRATE FORCE
+        // ====================================================
+
+        else if (mode == "cal_force") {
+
+          float knownMassKg = 0.0;
+
+          if (
+            request->hasParam("weight")
+          ) {
+
+            knownMassKg =
+              request
+                ->getParam("weight")
+                ->value()
+                .toFloat();
+          }
+
+
+          float newFactor = 0.0;
+
+          long rawReading = 0;
+
+
+          bool success =
+            calibrateForce(
+              knownMassKg,
+              newFactor,
+              rawReading
+            );
+
+
+          if (!success) {
+
+            request->send(
+              400,
+              "application/json",
+
+              "{\"mode\":\"cal_force\","
+              "\"status\":\"error\","
+              "\"msg\":\"Invalid weight or no load-cell change detected\"}"
+            );
+
+            return;
+          }
+
+
+          float knownForceN =
+            knownMassKg * GRAVITY;
+
+
+          char json[240];
+
+          snprintf(
+            json,
+            sizeof(json),
+
+            "{\"mode\":\"cal_force\","
+            "\"status\":\"success\","
+            "\"factor\":%.6f,"
+            "\"weightKg\":%.4f,"
+            "\"forceN\":%.4f,"
+            "\"raw\":%ld,"
+            "\"zeroRaw\":%ld}",
+
+            newFactor,
+
+            knownMassKg,
+
+            knownForceN,
+
+            rawReading,
+
+            forceZeroRaw
+          );
+
+
+          request->send(
+            200,
+            "application/json",
+            json
+          );
+        }
+
+
+        // ====================================================
+        // CALIBRATE FORCE - ALIAS
+        // ====================================================
+
+        else if (mode == "calibrate_force") {
+
+          float knownMassKg =
+            request->hasParam("weight")
+              ?
+            request
+              ->getParam("weight")
+              ->value()
+              .toFloat()
+              :
+            0.0;
+
+
+          float newFactor = 0.0;
+
+          long rawReading = 0;
+
+
+          bool success =
+            calibrateForce(
+              knownMassKg,
+              newFactor,
+              rawReading
+            );
+
+
+          if (!success) {
+
+            request->send(
+              400,
+              "application/json",
+
+              "{\"status\":\"error\"}"
+            );
+
+            return;
+          }
+
+
+          char json[160];
+
+          snprintf(
+            json,
+            sizeof(json),
+
+            "{\"mode\":\"calibrate_force\","
+            "\"status\":\"success\","
+            "\"factor\":%.6f}",
+
+            newFactor
+          );
+
+
+          request->send(
+            200,
+            "application/json",
+            json
+          );
+        }
+
+
+        // ====================================================
+        // CALIBRATE TORQUE
+        // ====================================================
+
+        else if (mode == "cal_torque") {
+
+          float knownTorque =
+            request->hasParam("torque")
+              ?
+            request
+              ->getParam("torque")
+              ->value()
+              .toFloat()
+              :
+            0.38;
+
+
+          long readingSum = 0;
+
+          for (int i = 0; i < 100; i++) {
+
+            readingSum +=
+              analogRead(
+                TORQUE_ANALOG_PIN
+              );
+
+            delay(5);
+          }
+
+
+          float currentReading =
+            (float)readingSum / 100.0;
+
+
+          float adcChange =
+            currentReading -
+            torqueZeroVoltage;
+
+
+          if (
+            knownTorque <= 0 ||
+            adcChange == 0
+          ) {
+
+            request->send(
+              400,
+              "application/json",
+
+              "{\"mode\":\"cal_torque\","
+              "\"status\":\"error\","
+              "\"msg\":\"Invalid torque or no ADC change detected\"}"
+            );
+
+            return;
+          }
+
+
+          torqueCalibrationFactor =
+            knownTorque / adcChange;
+
+
+          char json[160];
+
+          snprintf(
+            json,
+            sizeof(json),
+
+            "{\"mode\":\"cal_torque\","
+            "\"status\":\"success\","
+            "\"factor\":%.6f}",
+
+            torqueCalibrationFactor
+          );
+
+
+          request->send(
+            200,
+            "application/json",
+            json
+          );
+        }
+
+
+        // ====================================================
+        // CALIBRATE TORQUE - ALIAS
+        // ====================================================
+
+        else if (mode == "calibrate_torque") {
+
+          float knownTorque =
+            request->hasParam("torque")
+              ?
+            request
+              ->getParam("torque")
+              ->value()
+              .toFloat()
+              :
+            0.38;
+
+
+          long readingSum = 0;
+
+          for (int i = 0; i < 100; i++) {
+
+            readingSum +=
+              analogRead(
+                TORQUE_ANALOG_PIN
+              );
+
+            delay(5);
+          }
+
+
+          float currentReading =
+            (float)readingSum / 100.0;
+
+
+          float adcChange =
+            currentReading -
+            torqueZeroVoltage;
+
+
+          if (
+            knownTorque > 0 &&
+            adcChange != 0
+          ) {
+
+            torqueCalibrationFactor =
+              knownTorque / adcChange;
+          }
+
+
+          char json[128];
+
+          snprintf(
+            json,
+            sizeof(json),
+
+            "{\"mode\":\"calibrate_torque\","
+            "\"status\":\"success\","
+            "\"factor\":%.6f}",
+
+            torqueCalibrationFactor
+          );
+
+
+          request->send(
+            200,
+            "application/json",
+            json
+          );
+        }
+
+
+        // ====================================================
+        // INVALID
+        // ====================================================
+
+        else {
+
+          request->send(
+            400,
+            "application/json",
+
+            "{\"error\":\"Invalid or missing mode parameter\"}"
+          );
+        }
+      }
+    );
   }
 
 
@@ -472,37 +1306,20 @@ void setup() {
   else {
 
     Serial.println(
-      "No saved WiFi "
-      "(or connection failed)."
+      "No saved WiFi (or connection failed)."
     );
-
 
     Serial.println(
-      "Starting setup portal."
+      "Starting setup portal. Connect to 'Screwdriver-Setup'."
     );
-
-
-    Serial.println(
-      "Connect to the "
-      "'Screwdriver-Setup' WiFi network."
-    );
-
 
     WiFiProvision::startAPMode();
 
-
-    WiFiProvision::setupPortalRoutes(
-      server
-    );
+    WiFiProvision::setupPortalRoutes(server);
   }
 
 
-  // ==========================================================
-  // START SERVER
-  // ==========================================================
-
   server.begin();
-
 
   Serial.println(
     "Web server started."
@@ -516,45 +1333,57 @@ void setup() {
 
 void loop() {
 
-  // Handles DNS requests when AP setup mode is active.
   WiFiProvision::handleLoop();
 
 
-  // ==========================================================
-  // IMPORTANT
-  //
-  // In AP setup mode we don't run the sensor dashboard.
-  // Once STA connects, this returns false and the HX711 runs.
-  // ==========================================================
-
-  if (
-    WiFiProvision::isAPMode()
-  ) {
-
+  if (WiFiProvision::isAPMode()) {
     return;
   }
 
 
   ws.cleanupClients();
 
-
-  unsigned long now =
-    millis();
+  unsigned long now = millis();
 
 
   // ==========================================================
-  // HX711 SAMPLE
+  // SENSOR SAMPLE
   // ==========================================================
 
-  if (
-    scale.is_ready()
-  ) {
+  if (scaleForce.is_ready()) {
 
     lastSample = now;
 
 
+    // FORCE
+
     float force =
-      scale.get_units(1);
+      scaleForce.get_units(1);
+
+
+    // TORQUE
+
+    long strainTotal = 0;
+
+    for (int i = 0; i < 10; i++) {
+
+      strainTotal +=
+        analogRead(
+          TORQUE_ANALOG_PIN
+        );
+
+      delay(1);
+    }
+
+
+    float torque =
+      (
+        ((float)strainTotal / 10.0)
+        -
+        torqueZeroVoltage
+      )
+      *
+      torqueCalibrationFactor;
 
 
     // ========================================================
@@ -563,29 +1392,33 @@ void loop() {
 
     if (
       !dumping &&
-      now - lastLiveSend >=
-      LIVE_INTERVAL_MS &&
+      now - lastLiveSend >= LIVE_INTERVAL_MS &&
       ws.availableForWriteAll()
     ) {
 
       lastLiveSend = now;
 
 
-      char json[64];
-
+      char json[96];
 
       snprintf(
         json,
         sizeof(json),
-        "{\"type\":\"live\",\"t\":%lu,\"v\":%.4f}",
+
+        "{\"type\":\"live\","
+        "\"t\":%lu,"
+        "\"force\":%.4f,"
+        "\"torque\":%.4f}",
+
         now,
-        force
+
+        force,
+
+        torque
       );
 
 
-      ws.textAll(
-        json
-      );
+      ws.textAll(json);
     }
 
 
@@ -603,13 +1436,13 @@ void loop() {
         recordTimes[recordCount] =
           now - recordStartTime;
 
-
         recordForce[recordCount] =
           force;
 
+        recordTorque[recordCount] =
+          torque;
 
         recordCount++;
-
       }
 
       else {
@@ -635,18 +1468,14 @@ void loop() {
 
   if (dumping) {
 
-    if (
-      ws.count() == 0
-    ) {
+    if (ws.count() == 0) {
 
       Serial.println(
         "No client connected - aborting dump"
       );
 
-
       dumping = false;
     }
-
 
     else if (
       ws.availableForWriteAll()
@@ -667,7 +1496,7 @@ void loop() {
       }
 
 
-      static char buf[1200];
+      static char buf[1400];
 
       int pos = 0;
 
@@ -675,6 +1504,7 @@ void loop() {
       pos += snprintf(
         buf + pos,
         sizeof(buf) - pos,
+
         "{\"type\":\"data\",\"rows\":\""
       );
 
@@ -685,10 +1515,7 @@ void loop() {
         i++
       ) {
 
-        if (
-          i > dumpIndex
-        ) {
-
+        if (i > dumpIndex) {
           buf[pos++] = ';';
         }
 
@@ -696,9 +1523,14 @@ void loop() {
         pos += snprintf(
           buf + pos,
           sizeof(buf) - pos,
-          "%lu,%.4f",
+
+          "%lu,%.4f,%.4f",
+
           recordTimes[i],
-          recordForce[i]
+
+          recordForce[i],
+
+          recordTorque[i]
         );
       }
 
@@ -706,13 +1538,12 @@ void loop() {
       pos += snprintf(
         buf + pos,
         sizeof(buf) - pos,
+
         "\"}"
       );
 
 
-      ws.textAll(
-        buf
-      );
+      ws.textAll(buf);
 
 
       dumpIndex =
@@ -721,8 +1552,11 @@ void loop() {
 
       Serial.printf(
         "Dump progress: %u / %u, free heap: %u\n",
+
         dumpIndex,
+
         recordCount,
+
         ESP.getFreeHeap()
       );
 
@@ -738,14 +1572,14 @@ void loop() {
         snprintf(
           done,
           sizeof(done),
+
           "{\"type\":\"done\",\"count\":%u}",
+
           recordCount
         );
 
 
-        ws.textAll(
-          done
-        );
+        ws.textAll(done);
 
 
         dumping = false;
