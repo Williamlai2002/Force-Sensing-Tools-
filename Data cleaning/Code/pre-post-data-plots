@@ -1,0 +1,50 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.interpolate import CubicSpline
+from scipy.signal import butter, filtfilt
+
+base = "/Users/williamslaptop/Desktop/FYP B/New Screwdriver Plots + Data"
+
+raw = pd.read_csv(
+    f"{base}/screw_driver_data_good/p1_p_t1.csv"
+)
+
+raw = raw.sort_values("time_seconds")
+raw = raw.drop_duplicates(subset="time_seconds")
+
+t = raw["time_seconds"].to_numpy()
+torque = raw["torque_nm"].to_numpy()
+
+# Match your preprocessing timeline
+common_time = np.arange(0, 21, 0.05)
+
+# Interpolation only
+spline = CubicSpline(t, torque, extrapolate=False)
+interpolated = spline(common_time)
+
+# Filter only the valid interpolated interval
+valid = np.isfinite(interpolated)
+
+b, a = butter(2, 1.82, btype="low", fs=20)
+
+filtered = np.full_like(interpolated, np.nan)
+filtered[valid] = filtfilt(b, a, interpolated[valid])
+
+print(f"Raw maximum:          {np.max(torque):.4f} N·m")
+print(f"Interpolated maximum: {np.nanmax(interpolated):.4f} N·m")
+print(f"Filtered maximum:     {np.nanmax(filtered):.4f} N·m")
+
+plt.figure(figsize=(12, 5))
+
+plt.plot(t, torque, label="Raw", alpha=0.6)
+plt.plot(common_time, interpolated, label="Interpolated", alpha=0.7)
+plt.plot(common_time, filtered, label="Filtered (1.82 Hz)", linewidth=2)
+
+plt.xlabel("Time (s)")
+plt.ylabel("Torque (N·m)")
+plt.title("Torque Preprocessing Comparison - P1 Phillips Trial 1")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
